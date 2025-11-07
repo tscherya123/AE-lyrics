@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import re
-import tempfile
 import threading
-import unicodedata
 import wave
 import tkinter.messagebox as messagebox
 from dataclasses import dataclass
@@ -87,99 +84,114 @@ class SRTBuilder:
         if not line_infos:
             return None
 
-        lyric_tokens: list[tuple[int, int, int, str]] = []
-        for line_global_index, (block_index, line_index, line) in enumerate(line_infos):
-            for token_index, token in enumerate(self._tokenize_line(line)):
-                normalized = self._normalize_token(token)
-                if normalized:
-                    lyric_tokens.append((line_global_index, block_index, token_index, normalized))
-
-        recognized_tokens: list[tuple[int, str]] = []
-        for idx, item in enumerate(word_timings):
-            normalized = self._normalize_token(item.word)
-            if normalized:
-                recognized_tokens.append((idx, normalized))
-
-        if not lyric_tokens or not recognized_tokens:
+        recognized_words: list[WordTiming] = [
+            timing for timing in word_timings if self._normalize_for_similarity(timing.word)
+        ]
+        if not recognized_words:
             return None
 
-        lyric_norms = [token[-1] for token in lyric_tokens]
-        recognized_norms = [token[1] for token in recognized_tokens]
+        normalized_words = [self._normalize_for_similarity(timing.word) for timing in recognized_words]
 
-        alignment = self._align_tokens(recognized_norms, lyric_norms)
-        if not alignment:
-            return None
+        try:
+            from Levenshtein import ratio as levenshtein_ratio  # type: ignore
+        except ImportError:  # pragma: no cover - optional dependency
+            levenshtein_ratio = None
+            import difflib
 
-        line_ranges: list[tuple[float | None, float | None]] = [(None, None) for _ in line_infos]
-        for lyric_index, recognized_index in alignment.items():
-            if 0 <= lyric_index < len(lyric_tokens) and 0 <= recognized_index < len(recognized_tokens):
-                line_index = lyric_tokens[lyric_index][0]
-                word_index = recognized_tokens[recognized_index][0]
-                timing = word_timings[word_index]
-                start, end = line_ranges[line_index]
-                if start is None or timing.start < start:
-                    start = timing.start
-                if end is None or timing.end > end:
-                    end = timing.end
-                line_ranges[line_index] = (start, end)
+            def similarity(a: str, b: str) -> float:
+                if not a or not b:
+                    return 0.0
+                return difflib.SequenceMatcher(a=a, b=b, autojunk=False).ratio()
 
-        line_ranges = self._fill_missing_line_timings(line_ranges, line_infos)
-        if not line_ranges:
-            return None
+        else:
+
+            def similarity(a: str, b: str) -> float:
+                if not a or not b:
+                    return 0.0
+                return float(levenshtein_ratio(a, b))
+
+        line_ranges: list[tuple[float, float]] = []
+        cursor = 0
+        total_words = len(recognized_words)
+        max_window_size = 12
+        max_search_span = 320
+
+        for index, (_, _, line_text) in enumerate(line_infos):
+            target = self._normalize_for_similarity(line_text)
+            best_score = 0.0
+            best_range: tuple[int, int] | None = None
+
+            search_limit = min(total_words, cursor + max_search_span)
+            for start_idx in range(cursor, search_limit):
+                for end_idx in range(start_idx + 1, min(total_words, start_idx + max_window_size) + 1):
+                    candidate_parts = [
+                        normalized_words[pos] for pos in range(start_idx, end_idx) if normalized_words[pos]
+                    ]
+                    if not candidate_parts:
+                        continue
+                    candidate = " ".join(candidate_parts)
+                    score = similarity(candidate, target)
+                    if score > best_score:
+                        best_score = score
+                        best_range = (start_idx, end_idx)
+
+            if best_range is None:
+                if line_ranges:
+                    _, previous_end = line_ranges[-1]
+                else:
+                    previous_end = 0.0
+                start_time = max(previous_end + MIN_GAP_BETWEEN_LINES, 0.0)
+                estimated = self._estimate_block_duration([line_text])
+                end_time = start_time + max(estimated, MIN_BLOCK_DURATION)
+            else:
+                start_idx, end_idx = best_range
+                start_time = recognized_words[start_idx].start
+                end_time = recognized_words[end_idx - 1].end
+                if index < len(line_infos) - 1:
+                    end_time += MIN_GAP_BETWEEN_LINES + 0.03
+                cursor = end_idx
+
+            if line_ranges:
+                _, previous_end = line_ranges[-1]
+                if start_time < previous_end + MIN_GAP_BETWEEN_LINES:
+                    start_time = previous_end + MIN_GAP_BETWEEN_LINES
+            if end_time <= start_time:
+                end_time = start_time + max(0.2, MIN_GAP_BETWEEN_LINES)
+
+            if self._audio_duration is not None:
+                start_time = max(0.0, min(start_time, self._audio_duration))
+                end_time = min(end_time, self._audio_duration)
+                if end_time <= start_time:
+                    end_time = min(self._audio_duration, start_time + max(0.2, MIN_GAP_BETWEEN_LINES))
+
+            line_ranges.append((start_time, end_time))
 
         block_timings: list[tuple[float, float]] = []
+        cursor = 0
         for block_index, block in enumerate(blocks):
-            relevant_lines = [
+            relevant = [
                 line_ranges[idx]
                 for idx, (line_block, _, _) in enumerate(line_infos)
                 if line_block == block_index
             ]
-            if not relevant_lines:
+            if not relevant:
                 return None
-            starts = [start for start, _ in relevant_lines if start is not None]
-            ends = [end for _, end in relevant_lines if end is not None]
-            if not starts or not ends:
-                return None
-            block_timings.append((min(starts), max(ends)))
+            starts = [start for start, _ in relevant]
+            ends = [end for _, end in relevant]
+            start = min(starts)
+            end = max(ends)
+            if start < cursor:
+                start = cursor
+            if end <= start:
+                end = start + max(0.2, MIN_GAP_BETWEEN_LINES)
+            cursor = end + PAUSE_BETWEEN_BLOCKS
+            block_timings.append((start, end))
 
         return self._ensure_monotonic(block_timings)
 
-    def _fill_missing_line_timings(
-        self,
-        line_ranges: list[tuple[float | None, float | None]],
-        line_infos: list[tuple[int, int, str]],
-    ) -> list[tuple[float, float]] | None:
-        filled: list[tuple[float, float]] = []
-        last_end = 0.0
-        total_lines = len(line_ranges)
-
-        for index, ((start, end), (_, _, line_text)) in enumerate(zip(line_ranges, line_infos)):
-            if start is None or end is None:
-                duration = self._estimate_block_duration([line_text])
-                start = max(last_end + MIN_GAP_BETWEEN_LINES, 0.0)
-                end = start + duration
-
-                for future_index in range(index + 1, total_lines):
-                    next_start, next_end = line_ranges[future_index]
-                    if next_start is not None and next_end is not None:
-                        available = next_start - MIN_GAP_BETWEEN_LINES - start
-                        if available > 0:
-                            end = min(start + duration, start + available)
-                        break
-            else:
-                start = max(start, last_end + MIN_GAP_BETWEEN_LINES)
-
-            if end <= start:
-                end = start + max(0.2, MIN_GAP_BETWEEN_LINES)
-
-            if self._audio_duration:
-                end = min(end, self._audio_duration)
-                start = min(start, end)
-
-            filled.append((start, end))
-            last_end = end
-
-        return filled
+    @staticmethod
+    def _normalize_for_similarity(text: str) -> str:
+        return re.sub(r"[^\w’ʼ'-]+", " ", text.lower(), flags=re.UNICODE).strip()
 
     def _ensure_monotonic(self, timings: list[tuple[float, float]]) -> list[tuple[float, float]]:
         adjusted: list[tuple[float, float]] = []
@@ -195,34 +207,6 @@ class SRTBuilder:
             cursor = end + PAUSE_BETWEEN_BLOCKS
         return adjusted
 
-    @staticmethod
-    def _align_tokens(recognized: Sequence[str], lyrics: Sequence[str]) -> dict[int, int]:
-        try:
-            import difflib
-        except ImportError:  # pragma: no cover - should always be available
-            return {}
-
-        matcher = difflib.SequenceMatcher(a=recognized, b=lyrics, autojunk=False)
-        alignment: dict[int, int] = {}
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag in {"equal", "replace"}:
-                length = min(i2 - i1, j2 - j1)
-                for offset in range(length):
-                    alignment[j1 + offset] = i1 + offset
-        return alignment
-
-    @staticmethod
-    def _tokenize_line(line: str) -> list[str]:
-        return re.findall(r"[\w’']+", line, flags=re.UNICODE)
-
-    @staticmethod
-    def _normalize_token(token: str) -> str:
-        normalized_chars: list[str] = []
-        for char in token.lower():
-            category = unicodedata.category(char)
-            if category.startswith(("L", "N")):
-                normalized_chars.append(char)
-        return "".join(normalized_chars)
 
     def _split_into_blocks(self, lyrics_text: str) -> list[list[str]]:
         blocks: list[list[str]] = []
@@ -303,6 +287,8 @@ class SRTGeneratorApp(ctk.CTk):
         self.selected_file: pathlib.Path | None = None
         self.audio_duration: float | None = None
         self._word_timings_cache: dict[pathlib.Path, list[WordTiming]] = {}
+        self._whisper_model = None
+        self._whisper_lock = threading.Lock()
         self.srt_result: str = ""
         self._transcription_in_progress = False
 
@@ -531,18 +517,19 @@ class SRTGeneratorApp(ctk.CTk):
 
         def worker() -> None:
             try:
-                text = self._offline_transcribe(path)
+                text, timings = self._offline_transcribe(path)
             except RuntimeError as exc:
                 message = str(exc)
                 self.after(0, self._handle_transcription_error, message)
                 return
-            self.after(0, self._handle_transcription_success, text)
+            self.after(0, self._handle_transcription_success, text, timings)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _handle_transcription_success(self, text: str) -> None:
+    def _handle_transcription_success(self, text: str, word_timings: list[WordTiming]) -> None:
         self._transcription_in_progress = False
-        if not text.strip():
+        cleaned = text.strip()
+        if not cleaned:
             messagebox.showinfo(
                 "Розпізнавання не дало результату",
                 "Не вдалося автоматично отримати текст пісні. Введіть його вручну.",
@@ -553,8 +540,11 @@ class SRTGeneratorApp(ctk.CTk):
             return
         self.lyrics_textbox.configure(state="normal")
         self.lyrics_textbox.delete("1.0", "end")
-        self.lyrics_textbox.insert("1.0", text.strip())
-        self.lyrics_textbox.configure(state="disabled")
+        self.lyrics_textbox.insert("1.0", cleaned)
+        if self.generate_checkbox_var.get():
+            self.lyrics_textbox.configure(state="disabled")
+        if self.selected_file and word_timings:
+            self._word_timings_cache[self.selected_file] = word_timings
         self._update_controls_state()
 
     def _handle_transcription_error(self, message: str) -> None:
@@ -565,68 +555,10 @@ class SRTGeneratorApp(ctk.CTk):
         self.lyrics_textbox.delete("1.0", "end")
         self._update_controls_state()
 
-    def _offline_transcribe(self, path: pathlib.Path) -> str:
-        try:
-            import speech_recognition as sr
-        except ImportError as exc:  # pragma: no cover - optional feature
-            raise RuntimeError(
-                "Пакет speech_recognition не встановлено. Встановіть його та повторіть спробу."
-            ) from exc
-
-        recognizer = sr.Recognizer()
-        temp_path: pathlib.Path | None = None
-        try:
-            try:
-                with sr.AudioFile(str(path)) as source:
-                    audio_data = recognizer.record(source)
-            except ValueError:
-                temp_path = self._convert_audio_to_wav(path)
-                with sr.AudioFile(str(temp_path)) as source:
-                    audio_data = recognizer.record(source)
-        except Exception as exc:  # pragma: no cover - delegated to recognizer
-            raise RuntimeError("Не вдалося обробити вибраний аудіофайл.") from exc
-        finally:
-            if temp_path and temp_path.exists():
-                temp_path.unlink(missing_ok=True)
-
-        if not hasattr(recognizer, "recognize_vosk"):
-            raise RuntimeError(
-                "Поточна версія speech_recognition не підтримує метод recognize_vosk. "
-                "Оновіть пакет або скористайтеся ручним введенням тексту."
-            )
-
-        try:
-            return recognizer.recognize_vosk(audio_data)
-        except sr.RequestError:
-            raise RuntimeError(
-                "Для офлайн-розпізнавання потрібна установка vosk-моделі. "
-                "Переконайтеся, що встановлено пакет vosk і завантажено модель."
-            )
-        except sr.UnknownValueError:
-            return ""
-
-    def _convert_audio_to_wav(self, path: pathlib.Path) -> pathlib.Path:
-        try:
-            from pydub import AudioSegment
-        except ImportError as exc:  # pragma: no cover - optional feature
-            raise RuntimeError(
-                "Формат файлу не підтримується без пакетів pydub та ffmpeg. "
-                "Встановіть їх або надайте файл у форматі WAV/FLAC."
-            ) from exc
-
-        try:
-            audio = AudioSegment.from_file(path)
-        except Exception as exc:  # pragma: no cover - delegated to pydub
-            raise RuntimeError("Не вдалося прочитати аудіофайл для конвертації.") from exc
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            temp_path = pathlib.Path(tmp.name)
-        try:
-            audio.export(temp_path, format="wav")
-        except Exception as exc:  # pragma: no cover - delegated to pydub/ffmpeg
-            temp_path.unlink(missing_ok=True)
-            raise RuntimeError("Не вдалося конвертувати аудіофайл у формат WAV.") from exc
-        return temp_path
+    def _offline_transcribe(self, path: pathlib.Path) -> tuple[str, list[WordTiming]]:
+        lines, word_timings = self._transcribe_with_whisper(path)
+        text = "\n".join(line for line in lines if line).strip()
+        return text, word_timings
 
     def _detect_audio_duration(self, path: pathlib.Path) -> float | None:
         suffix = path.suffix.lower()
@@ -670,121 +602,103 @@ class SRTGeneratorApp(ctk.CTk):
             return timings
 
     def _extract_word_timings(self, path: pathlib.Path) -> list[WordTiming]:
-        try:
-            from vosk import KaldiRecognizer, Model
-        except ImportError as exc:  # pragma: no cover - optional feature
-            raise RuntimeError(
-                "Пакет vosk не встановлено. Встановіть його та вкажіть шлях до моделі "
-                "у змінній середовища VOSK_MODEL_PATH, щоб синхронізувати текст."
-            ) from exc
-
-        model_path = os.environ.get("VOSK_MODEL_PATH")
-        if not model_path:
-            raise RuntimeError(
-                "Не вказано шлях до vosk-моделі. Задайте змінну середовища VOSK_MODEL_PATH "
-                "на каталог із попередньо завантаженою моделлю."
-            )
-
-        model_dir = pathlib.Path(model_path).expanduser()
-        if not model_dir.exists():
-            raise RuntimeError(f"Каталог з vosk-моделлю не знайдено: {model_dir}")
-
-        prepared_audio, temp_created = self._prepare_audio_for_vosk(path)
-
-        try:
-            model = Model(str(model_dir))
-        except Exception as exc:  # pragma: no cover - delegated to vosk
-            if temp_created:
-                prepared_audio.unlink(missing_ok=True)
-            raise RuntimeError("Не вдалося завантажити vosk-модель.") from exc
-
-        recognizer = KaldiRecognizer(model, 16000)
-        recognizer.SetWords(True)
-
-        word_timings: list[WordTiming] = []
-        try:
-            with wave.open(str(prepared_audio), "rb") as wav_file:
-                if wav_file.getframerate() != 16000 or wav_file.getnchannels() != 1:
-                    raise RuntimeError(
-                        "Файл не вдалося привести до формату PCM 16кГц mono, необхідного для vosk."
-                    )
-
-                while True:
-                    data = wav_file.readframes(4000)
-                    if not data:
-                        break
-                    if recognizer.AcceptWaveform(data):
-                        word_timings.extend(self._collect_vosk_words(recognizer.Result()))
-                word_timings.extend(self._collect_vosk_words(recognizer.FinalResult()))
-        except RuntimeError:
-            raise
-        except Exception as exc:  # pragma: no cover - delegated to vosk/wave
-            raise RuntimeError("Не вдалося обробити аудіо для синхронізації.") from exc
-        finally:
-            if temp_created:
-                prepared_audio.unlink(missing_ok=True)
-
+        _, word_timings = self._transcribe_with_whisper(path)
         if not word_timings:
-            raise RuntimeError("Не вдалося отримати слова з vosk-розпізнавання.")
-
+            raise RuntimeError("Не вдалося отримати слова з faster-whisper.")
         return word_timings
 
-    @staticmethod
-    def _collect_vosk_words(result_json: str) -> list[WordTiming]:
-        try:
-            payload = json.loads(result_json)
-        except json.JSONDecodeError:
-            return []
+    def _get_whisper_model(self):
+        if hasattr(self, "_whisper_lock"):
+            lock = self._whisper_lock
+        else:  # pragma: no cover - defensive path for older instances
+            lock = threading.Lock()
+            self._whisper_lock = lock
 
-        words_data = payload.get("result")
-        if not isinstance(words_data, list):
-            return []
+        with lock:
+            if getattr(self, "_whisper_model", None) is not None:
+                return self._whisper_model
 
-        collected: list[WordTiming] = []
-        for item in words_data:
-            word = str(item.get("word", ""))
             try:
-                start = float(item["start"])
-                end = float(item["end"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            collected.append(WordTiming(word=word, start=start, end=end))
-        return collected
+                from faster_whisper import WhisperModel
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise RuntimeError(
+                    "Пакет faster-whisper не встановлено. Встановіть його (pip install faster-whisper) "
+                    "та повторіть спробу."
+                ) from exc
 
-    def _prepare_audio_for_vosk(self, path: pathlib.Path) -> tuple[pathlib.Path, bool]:
+            model_size = os.environ.get("WHISPER_MODEL_SIZE", "medium")
+            device = os.environ.get("WHISPER_DEVICE", "cpu")
+            compute_type = os.environ.get("WHISPER_COMPUTE_TYPE")
+            if compute_type is None:
+                compute_type = "float16" if device not in {"auto", "cpu"} else "float32"
+
+            try:
+                self._whisper_model = WhisperModel(
+                    model_size,
+                    device=device,
+                    compute_type=compute_type,
+                )
+            except Exception as exc:
+                if not (device == "cpu" and compute_type == "float32"):
+                    try:
+                        self._whisper_model = WhisperModel(
+                            model_size,
+                            device="cpu",
+                            compute_type="float32",
+                        )
+                    except Exception as fallback_exc:  # pragma: no cover - delegated to faster-whisper
+                        raise RuntimeError(
+                            "Не вдалося ініціалізувати модель faster-whisper. "
+                            "Перевірте змінні WHISPER_MODEL_SIZE, WHISPER_DEVICE та WHISPER_COMPUTE_TYPE."
+                        ) from fallback_exc
+                else:
+                    raise RuntimeError(
+                        "Не вдалося ініціалізувати модель faster-whisper. "
+                        "Перевірте змінні WHISPER_MODEL_SIZE, WHISPER_DEVICE та WHISPER_COMPUTE_TYPE."
+                    ) from exc
+
+            return self._whisper_model
+
+    def _transcribe_with_whisper(self, path: pathlib.Path) -> tuple[list[str], list[WordTiming]]:
+        model = self._get_whisper_model()
+        language = os.environ.get("WHISPER_LANGUAGE", "uk")
         try:
-            with wave.open(str(path), "rb") as wav_file:
-                if (
-                    wav_file.getframerate() == 16000
-                    and wav_file.getnchannels() == 1
-                    and wav_file.getsampwidth() == 2
-                ):
-                    return path, False
-        except (wave.Error, OSError):
-            pass
+            segments, _ = model.transcribe(
+                str(path),
+                language=language,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 300},
+            )
+        except Exception as exc:  # pragma: no cover - delegated to faster-whisper
+            raise RuntimeError("Не вдалося розпізнати аудіо за допомогою faster-whisper.") from exc
 
-        try:
-            from pydub import AudioSegment
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError(
-                "Для приведення файлу до формату PCM 16кГц mono необхідні пакети pydub та ffmpeg."
-            ) from exc
+        lines: list[str] = []
+        words: list[WordTiming] = []
+        for segment in segments:
+            text = getattr(segment, "text", "")
+            if text:
+                cleaned_text = text.strip()
+                if cleaned_text:
+                    lines.append(cleaned_text)
 
-        try:
-            audio = AudioSegment.from_file(path)
-        except Exception as exc:  # pragma: no cover - delegated to pydub
-            raise RuntimeError("Не вдалося прочитати аудіофайл для синхронізації.") from exc
+            for word in getattr(segment, "words", []) or []:
+                token = getattr(word, "word", "")
+                cleaned_token = token.strip()
+                if not cleaned_token:
+                    continue
+                start_raw = getattr(word, "start", None)
+                end_raw = getattr(word, "end", None)
+                try:
+                    start_value = float(start_raw)
+                    end_value = float(end_raw)
+                except (TypeError, ValueError):
+                    continue
+                if end_value < start_value:
+                    continue
+                words.append(WordTiming(word=cleaned_token, start=start_value, end=end_value))
 
-        audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            temp_path = pathlib.Path(tmp.name)
-        try:
-            audio.export(temp_path, format="wav")
-        except Exception as exc:  # pragma: no cover - delegated to pydub/ffmpeg
-            temp_path.unlink(missing_ok=True)
-            raise RuntimeError("Не вдалося конвертувати аудіо до формату WAV для vosk.") from exc
-
-        return temp_path, True
+        return lines, words
 
 
 def main() -> None:
