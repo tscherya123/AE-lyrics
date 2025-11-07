@@ -51,7 +51,13 @@ def _format_timestamp(value: float) -> str:
 
 def _atomic_write(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", newline="\n") as handle:
+    with tempfile.NamedTemporaryFile(
+        "w",
+        delete=False,
+        encoding="utf-8",
+        newline="\n",
+        dir=str(path.parent),
+    ) as handle:
         handle.write(payload)
         temp_name = handle.name
     os.replace(temp_name, path)
