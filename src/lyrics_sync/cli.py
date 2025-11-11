@@ -42,7 +42,7 @@ def main(argv: List[str] | None = None) -> int:
     try:
         print("[1/3] Розпізнавання аудіо…")
         transcriber = AudioTranscriber()
-        words, _, reconstructed = transcriber.transcribe(audio_path)
+        transcription = transcriber.transcribe(audio_path)
     except FileNotFoundError:
         print("Помилка: не вдалося відкрити аудіофайл для читання.", file=sys.stderr)
         return 1
@@ -50,13 +50,62 @@ def main(argv: List[str] | None = None) -> int:
         print(f"Помилка розпізнавання: {exc}", file=sys.stderr)
         return 1
 
-    if not words:
+    if not transcription.words:
         print("Помилка: не вдалося розпізнати слова у файлі.", file=sys.stderr)
         return 1
 
+    audio_duration = transcription.audio_duration
+    duration_after_vad = transcription.duration_after_vad
+    last_segment_end = (
+        transcription.segments[-1].end if transcription.segments else 0.0
+    )
+
+    if audio_duration is not None:
+        print(
+            f"Тривалість аудіо за даними моделі: {audio_duration:.2f} с"
+        )
+    if duration_after_vad is not None and audio_duration is not None:
+        removed = max(audio_duration - duration_after_vad, 0.0)
+        if removed > 0.5:
+            percent = removed / audio_duration * 100
+            print(
+                "Попередження: VAD-фільтр відкинув "
+                f"близько {removed:.2f} с ({percent:.1f} % від аудіо)."
+            )
+    if (
+        audio_duration is not None
+        and audio_duration - last_segment_end > 1.0
+    ):
+        covered = last_segment_end / audio_duration * 100
+        print(
+            "Попередження: розпізнані сегменти покривають лише "
+            f"~{covered:.1f} % тривалості аудіо."
+        )
+
+    print("Розпізнані сегменти:")
+    for index, segment in enumerate(transcription.segments, start=1):
+        print(
+            f"  [{index:02d}] {segment.start:7.2f}–{segment.end:7.2f} с | "
+            f"{segment.text or '(порожньо)'}"
+        )
+
+    print("Розпізнані слова:")
+    for index, word in enumerate(transcription.words, start=1):
+        confidence = (
+            f" ({word.confidence:.2f})" if word.confidence is not None else ""
+        )
+        print(
+            f"  [{index:03d}] {word.start:7.2f}–{word.end:7.2f} с | "
+            f"{word.text}{confidence}"
+        )
+
     print("[2/3] Вирівнювання рядків…")
     aligner = LyricsAligner()
-    result = aligner.align(lyrics_lines, words, reconstructed)
+    result = aligner.align(
+        lyrics_lines,
+        transcription.words,
+        transcription.used_reconstruction,
+    )
 
     print("[3/3] Експорт SRT…")
     output_path = Path(args.output) if args.output else audio_path.with_suffix(".srt")

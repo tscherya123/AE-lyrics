@@ -44,6 +44,17 @@ class SegmentTranscription:
         return max(0.0, self.end - self.start)
 
 
+@dataclass
+class TranscriptionResult:
+    """Structured container with transcription payload and metadata."""
+
+    words: List[WordTiming]
+    segments: List[SegmentTranscription]
+    used_reconstruction: bool
+    audio_duration: float | None
+    duration_after_vad: float | None
+
+
 class AudioTranscriber:
     """Transcribe audio and provide word timings suitable for alignment."""
 
@@ -88,17 +99,14 @@ class AudioTranscriber:
                 raise last_error
         return self._model
 
-    def transcribe(self, audio_path: str | Path) -> tuple[List[WordTiming], List[SegmentTranscription], bool]:
-        """Transcribe ``audio_path`` and return word timings.
-
-        Returns a tuple ``(words, segments, used_reconstruction)``.
-        """
+    def transcribe(self, audio_path: str | Path) -> TranscriptionResult:
+        """Transcribe ``audio_path`` and return structured results for alignment."""
 
         model = self._ensure_model()
         segments: List[SegmentTranscription] = []
         words: List[WordTiming] = []
 
-        raw_segments, _info = model.transcribe(
+        raw_segments, info = model.transcribe(
             str(audio_path),
             beam_size=5,
             word_timestamps=True,
@@ -126,7 +134,13 @@ class AudioTranscriber:
         if needs_reconstruction:
             words = self._reconstruct_words_from_segments(segments)
 
-        return words, segments, needs_reconstruction
+        return TranscriptionResult(
+            words=words,
+            segments=segments,
+            used_reconstruction=needs_reconstruction,
+            audio_duration=getattr(info, "duration", None),
+            duration_after_vad=getattr(info, "duration_after_vad", None),
+        )
 
     def _words_need_reconstruction(self, words: Sequence[WordTiming]) -> bool:
         tokens = [w.normalised for w in words if w.normalised]
