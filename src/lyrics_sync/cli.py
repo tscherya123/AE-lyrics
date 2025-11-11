@@ -42,7 +42,7 @@ def main(argv: List[str] | None = None) -> int:
     try:
         print("[1/3] Розпізнавання аудіо…")
         transcriber = AudioTranscriber()
-        words, _, reconstructed = transcriber.transcribe(audio_path)
+        words, segments, reconstructed = transcriber.transcribe(audio_path)
     except FileNotFoundError:
         print("Помилка: не вдалося відкрити аудіофайл для читання.", file=sys.stderr)
         return 1
@@ -53,6 +53,23 @@ def main(argv: List[str] | None = None) -> int:
     if not words:
         print("Помилка: не вдалося розпізнати слова у файлі.", file=sys.stderr)
         return 1
+
+    print("Розпізнані сегменти:")
+    for index, segment in enumerate(segments, start=1):
+        print(
+            f"  [{index:02d}] {segment.start:7.2f}–{segment.end:7.2f} с | "
+            f"{segment.text or '(порожньо)'}"
+        )
+
+    print("Розпізнані слова:")
+    for index, word in enumerate(words, start=1):
+        confidence = (
+            f" ({word.confidence:.2f})" if word.confidence is not None else ""
+        )
+        print(
+            f"  [{index:03d}] {word.start:7.2f}–{word.end:7.2f} с | "
+            f"{word.text}{confidence}"
+        )
 
     print("[2/3] Вирівнювання рядків…")
     aligner = LyricsAligner()
